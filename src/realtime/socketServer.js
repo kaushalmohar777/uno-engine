@@ -3,10 +3,10 @@
 // event envelope defined in eventContract.js (contract §5) — no
 // uno:play-card, uno:draw-card, uno:uno-call, or any other game-named event.
 //
-// This module wires generic session-lifecycle plumbing (join/start/leave,
-// turn rotation, reconnect, quick-chat relay). It does not implement UNO
-// rules — game:action is currently a generic pass-through/turn-rotation
-// stub for src/game/* to plug real validation into later.
+// UNO rules themselves live in src/game/* (engine.js is authoritative for
+// state transitions) — this module only authenticates sockets, transports
+// game:action payloads into the engine, and turns the engine's results back
+// into frontend-facing game:* events (including per-player hand privacy).
 import { Server } from 'socket.io';
 import config from '../config/index.js';
 import { EVENTS, buildEnvelope, validateEnvelope } from './eventContract.js';
@@ -14,6 +14,8 @@ import { authenticate, SessionAuthError } from './sessionAuth.js';
 import * as sessionStore from '../session/sessionStore.js';
 import * as reconnectManager from '../session/reconnectManager.js';
 import * as timeoutManager from '../session/timeoutManager.js';
+import * as engine from '../game/engine.js';
+import { reportMatchResult } from '../portalapi/resultWebhook.js';
 
 const QUICK_CHAT_KINDS = new Set(['good_luck', 'nice_move', 'oops', 'thanks', 'hurry_up', 'gg']);
 
@@ -21,26 +23,36 @@ function roomFor(session) {
   return session.gameEngineSessionId;
 }
 
-function emitTo(io, session, { type, kind, userId = null, data = {} }) {
+function emitToRoom(io, session, { event, type, kind, userId = null, data = {} }) {
   io.to(roomFor(session)).emit(
-    /** event name */ eventNameFor(type),
+    event,
     buildEnvelope({ type, kind, sessionId: session.gameEngineSessionId, matchId: session.matchId, userId, data })
   );
 }
 
-// Fixed event names map 1:1 to the outbound occasions we emit for.
-function eventNameFor(type) {
-  switch (type) {
-    case 'player_joined': return EVENTS.PLAYER_JOINED;
-    case 'player_left': return EVENTS.PLAYER_LEFT;
-    case 'started': return EVENTS.STARTED;
-    case 'state_updated': return EVENTS.STATE_UPDATED;
-    case 'turn_changed': return EVENTS.TURN_CHANGED;
-    case 'player_finished': return EVENTS.PLAYER_FINISHED;
-    case 'completed': return EVENTS.COMPLETED;
-    case 'error': return EVENTS.ERROR;
-    case 'quick_chat': return EVENTS.QUICK_CHAT;
-    default: return EVENTS.STATE_UPDATED;
+/** Sends a `game:state-updated` to a single connected human player, with that player's own hand attached — never another player's. */
+function emitStateToPlayer(io, session, sessionPlayer, { type, kind, actionUserId, extraData = {} }) {
+  if (sessionPlayer.isBot || !sessionPlayer.socketId) return;
+  io.to(sessionPlayer.socketId).emit(
+    EVENTS.STATE_UPDATED,
+    buildEnvelope({
+      type,
+      kind,
+      sessionId: session.gameEngineSessionId,
+      matchId: session.matchId,
+      userId: actionUserId,
+      data: {
+        ...engine.buildPublicView(session.game),
+        yourHand: engine.buildPrivateHand(session.game, sessionPlayer.userId),
+        ...extraData,
+      },
+    })
+  );
+}
+
+function broadcastState(io, session, { type, kind, actionUserId = null, extraData = {} }) {
+  for (const player of session.players) {
+    emitStateToPlayer(io, session, player, { type, kind, actionUserId, extraData });
   }
 }
 
@@ -58,36 +70,97 @@ function emitError(socket, session, matchId, message, kind = 'invalid_action') {
   );
 }
 
+function emitTurnChanged(io, session) {
+  const gameState = session.game;
+  const actorId = engine.currentActorId(gameState);
+  if (!actorId) return;
+  const player = engine.getPlayerByActorId(gameState, actorId);
+  emitToRoom(io, session, {
+    event: EVENTS.TURN_CHANGED,
+    type: 'turn_changed',
+    userId: player.userId,
+    data: { currentUserId: player.userId, seatNumber: player.seatNumber, turnDeadlineAt: Date.now() + config.turn.timeoutMs },
+  });
+}
+
+function emitPlayerFinished(io, session, finishedPlayers) {
+  for (const f of finishedPlayers) {
+    emitToRoom(io, session, {
+      event: EVENTS.PLAYER_FINISHED,
+      type: 'player_finished',
+      userId: f.userId,
+      data: { position: f.position, seatNumber: f.seatNumber, role: f.role, points: f.points },
+    });
+  }
+}
+
+function emitCompleted(io, session, results) {
+  session.status = 'completed';
+  emitToRoom(io, session, {
+    event: EVENTS.COMPLETED,
+    type: 'completed',
+    data: {
+      results,
+      winner: results.find((r) => r.role === 'winner') || results[0] || null,
+      losers: results.filter((r) => r.role === 'loser'),
+    },
+  });
+  reportMatchResult(session, { results, endedReason: 'completed' }).catch((err) => {
+    console.error(`[resultWebhook] unexpected error for match ${session.matchId}: ${err.message}`);
+  });
+}
+
+/** Applies an outcome from engine.js to sockets: state, finishes, completion, turn clock. */
+function applyOutcome(io, session, outcome, { type, kind, actionUserId }) {
+  broadcastState(io, session, { type, kind, actionUserId });
+
+  if (outcome.finishedPlayers.length > 0) {
+    emitPlayerFinished(io, session, outcome.finishedPlayers);
+  }
+
+  if (outcome.completed) {
+    timeoutManager.clearTurnTimer(session.gameEngineSessionId);
+    emitCompleted(io, session, outcome.results);
+    return;
+  }
+
+  if (outcome.turnChanged) {
+    emitTurnChanged(io, session);
+  }
+
+  // Either a normal turn handoff or a pending wild-color choice needs a
+  // fresh clock — both are "someone must act next" states.
+  if (outcome.turnChanged || outcome.awaitingColorChoice) {
+    armTurnTimer(io, session);
+  }
+}
+
+function armTurnTimer(io, session) {
+  timeoutManager.startTurnTimer(session.gameEngineSessionId, () => {
+    if (session.status !== 'active' || !session.game || session.game.status !== 'active') return;
+    const wasAwaitingColor = !!session.game.pendingAction;
+    const outcome = engine.forceAdvanceOnTimeout(session.game);
+    if (outcome.error) return; // no active turn to advance (shouldn't happen while active)
+    applyOutcome(io, session, outcome, {
+      type: wasAwaitingColor ? 'color_chosen' : 'card_drawn',
+      kind: 'timeout',
+      actionUserId: null,
+    });
+  });
+}
+
 function maybeStartMatch(io, session) {
   if (session.status !== 'pending') return;
   if (!sessionStore.allSeatsPresent(session)) return;
 
   session.status = 'active';
   session.startedAt = Date.now();
+  engine.startGame(session);
 
-  emitTo(io, session, { type: 'started' });
-
-  const firstTurnUserId = sessionStore.currentTurnUserId(session);
-  emitTo(io, session, {
-    type: 'turn_changed',
-    userId: firstTurnUserId,
-    data: { currentUserId: firstTurnUserId, turnDeadlineAt: Date.now() + config.turn.timeoutMs },
-  });
-
+  emitToRoom(io, session, { event: EVENTS.STARTED, type: 'started' });
+  broadcastState(io, session, { type: 'card_played', kind: 'initial_deal' });
+  emitTurnChanged(io, session);
   armTurnTimer(io, session);
-}
-
-function armTurnTimer(io, session) {
-  timeoutManager.startTurnTimer(session.gameEngineSessionId, () => {
-    if (session.status !== 'active') return;
-    const nextUserId = sessionStore.advanceTurn(session);
-    emitTo(io, session, {
-      type: 'turn_changed',
-      userId: nextUserId,
-      data: { currentUserId: nextUserId, turnDeadlineAt: Date.now() + config.turn.timeoutMs, reason: 'timeout' },
-    });
-    armTurnTimer(io, session);
-  });
 }
 
 export function createSocketServer(httpServer) {
@@ -130,8 +203,16 @@ export function createSocketServer(httpServer) {
     sessionStore.touchExpiry(session);
     reconnectManager.cancelDisconnectGrace(session.gameEngineSessionId, userId);
 
-    emitTo(io, session, { type: 'player_joined', userId });
-    maybeStartMatch(io, session);
+    emitToRoom(io, session, { event: EVENTS.PLAYER_JOINED, type: 'player_joined', userId });
+
+    if (session.status === 'pending') {
+      maybeStartMatch(io, session);
+    } else if (session.status === 'active' && session.game) {
+      // Reconnect mid-game: bring this one player's view current without
+      // re-broadcasting to everyone else.
+      const player = session.players.find((p) => p.userId === userId);
+      if (player) emitStateToPlayer(io, session, player, { type: 'card_played', kind: 'resync' });
+    }
 
     socket.on(EVENTS.ACTION, (message) => {
       const { valid, error } = validateEnvelope(message);
@@ -143,35 +224,48 @@ export function createSocketServer(httpServer) {
         emitError(socket, session, matchId, 'sessionId/matchId does not match this connection');
         return;
       }
-
-      if (session.status !== 'active') {
+      if (session.status !== 'active' || !session.game) {
         emitError(socket, session, matchId, 'Session is not active');
         return;
       }
 
-      if (sessionStore.currentTurnUserId(session) !== userId) {
-        emitError(socket, session, matchId, 'It is not your turn');
+      const data = message.data || {};
+      let outcome;
+      let responseType;
+
+      switch (message.type) {
+        case 'play_card':
+          outcome = engine.applyPlayCard(session.game, {
+            actorId: userId,
+            cardId: data.cardId,
+            chosenColor: data.chosenColor,
+            callUno: !!data.callUno,
+          });
+          responseType = 'card_played';
+          break;
+        case 'draw_card':
+          outcome = engine.applyDrawCard(session.game, { actorId: userId });
+          responseType = 'card_drawn';
+          break;
+        case 'call_uno':
+          outcome = engine.applyCallUno(session.game, { actorId: userId });
+          responseType = 'uno_called';
+          break;
+        case 'choose_color':
+          outcome = engine.applyChooseColor(session.game, { actorId: userId, chosenColor: data.chosenColor });
+          responseType = 'color_chosen';
+          break;
+        default:
+          emitError(socket, session, matchId, `Unsupported action type "${message.type}"`);
+          return;
+      }
+
+      if (outcome.error) {
+        emitError(socket, session, matchId, outcome.error.message, outcome.error.kind);
         return;
       }
 
-      // Generic pass-through: broadcast the accepted action as authoritative
-      // state, advance turn order, and reset the turn clock. Real UNO move
-      // validation/effects (skip, reverse, draw stacks, wild colors, win
-      // detection) belong in src/game/* and replace this stub.
-      emitTo(io, session, {
-        type: 'state_updated',
-        kind: message.kind,
-        userId,
-        data: { appliedType: message.type, appliedData: message.data },
-      });
-
-      const nextUserId = sessionStore.advanceTurn(session);
-      emitTo(io, session, {
-        type: 'turn_changed',
-        userId: nextUserId,
-        data: { currentUserId: nextUserId, turnDeadlineAt: Date.now() + config.turn.timeoutMs },
-      });
-      armTurnTimer(io, session);
+      applyOutcome(io, session, outcome, { type: responseType, kind: message.kind, actionUserId: userId });
     });
 
     socket.on(EVENTS.QUICK_CHAT, (message) => {
@@ -199,13 +293,14 @@ export function createSocketServer(httpServer) {
 
     socket.on('disconnect', () => {
       sessionStore.markPlayerDisconnected(session, userId);
-      emitTo(io, session, { type: 'player_left', kind: 'disconnected', userId });
+      emitToRoom(io, session, { event: EVENTS.PLAYER_LEFT, type: 'player_left', kind: 'disconnected', userId });
 
+      reconnectManager.cancelDisconnectGrace(session.gameEngineSessionId, userId);
       reconnectManager.scheduleDisconnectGrace(session.gameEngineSessionId, userId, () => {
         // Grace period lapsed with no reconnect. Generic plumbing stops
         // here — turning this into a forfeit (result webhook / match
-        // cleanup) belongs to the gameplay layer once implemented.
-        emitTo(io, session, { type: 'player_left', kind: 'left', userId });
+        // cleanup) belongs to the result-reporting layer once implemented.
+        emitToRoom(io, session, { event: EVENTS.PLAYER_LEFT, type: 'player_left', kind: 'left', userId });
       });
     });
   });

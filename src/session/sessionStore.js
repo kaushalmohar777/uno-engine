@@ -79,8 +79,8 @@ export function createSession({ source, contextId, matchId, gameTypeSlug, player
     createdAt: now,
     expiresAt: now + expiresInSec * 1000,
     startedAt: null,
-    turnOrder: sessionPlayers.map((p) => p.userId ?? `bot:${p.seatNumber}`),
-    currentTurnIndex: 0,
+    game: null, // set by src/game/engine.js#startGame once the match begins
+    resultReport: null,
   };
 
   sessions.set(gameEngineSessionId, session);
@@ -113,15 +113,6 @@ export function markPlayerDisconnected(session, userId) {
 
 export function allSeatsPresent(session) {
   return session.players.every((p) => p.isBot || p.connected);
-}
-
-export function currentTurnUserId(session) {
-  return session.turnOrder[session.currentTurnIndex];
-}
-
-export function advanceTurn(session) {
-  session.currentTurnIndex = (session.currentTurnIndex + 1) % session.turnOrder.length;
-  return currentTurnUserId(session);
 }
 
 export function touchExpiry(session) {
