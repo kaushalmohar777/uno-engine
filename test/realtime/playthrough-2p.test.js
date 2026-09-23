@@ -4,11 +4,9 @@ import { startServer, stopServer, createSession, connectClients, playToCompletio
 const PLAYERS = [
   { userId: '67286eb612db69183d1456f0', seatNumber: 1 },
   { userId: '6748179ed64d689e4ef197b3', seatNumber: 2 },
-  { userId: '67273a3312db69183d144616', seatNumber: 3 },
-  { userId: '6725f74012db69183d143524', seatNumber: 4 },
 ];
 
-describe('4-player UNO playthrough', function () {
+describe('2-player UNO playthrough', function () {
   this.timeout(20000);
 
   let httpServer;
@@ -20,27 +18,23 @@ describe('4-player UNO playthrough', function () {
 
   before(async () => {
     ({ httpServer, port } = await startServer());
-    matchId = `match_playthrough_4p_${Date.now()}`;
-    ({ sessionId, tokens } = await createSession(port, { matchId, contextId: '6aabc83303ddfbc39c7de50d', players: PLAYERS }));
+    matchId = `match_playthrough_2p_${Date.now()}`;
+    ({ sessionId, tokens } = await createSession(port, { matchId, contextId: '6aabc83303ddfbc39c7de50e', players: PLAYERS }));
   });
 
   after(async () => {
     await stopServer(httpServer, clients);
   });
 
-  it('plays a legal game to completion with a winner, losers, and leftover points', async () => {
+  it('plays a legal 2-player game to completion (reverse acts as skip, +2 stacking, wilds all exercised)', async () => {
     clients = connectClients(port, PLAYERS, tokens);
     const completed = await playToCompletion(clients, sessionId, matchId);
 
     expect(completed.winner).to.include({ role: 'winner', position: 1 });
-    expect(completed.losers).to.have.length(3);
-    expect(completed.losers.every((l) => l.role === 'loser')).to.equal(true);
-    expect(completed.results).to.have.length(4);
-
-    const loserPoints = completed.losers.reduce((sum, l) => sum + l.points, 0);
-    expect(completed.winner.points).to.equal(loserPoints);
-    expect(completed.winner.points).to.be.at.least(0);
-    expect(new Set(completed.results.map((r) => r.position))).to.deep.equal(new Set([1, 2, 3, 4]));
+    expect(completed.losers).to.have.length(1);
+    expect(completed.losers[0]).to.include({ role: 'loser', position: 2 });
+    expect(completed.results).to.have.length(2);
+    expect(completed.winner.points).to.equal(completed.losers[0].points);
 
     const winnerClient = clients.find((c) => c.userId === completed.winner.userId);
     expect(winnerClient.view.players.find((p) => p.userId === completed.winner.userId).handCount).to.equal(0);

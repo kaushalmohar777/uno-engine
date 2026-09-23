@@ -54,6 +54,7 @@ export function completeRound(gameState, winner) {
 
   gameState.status = 'completed';
   gameState.pendingAction = null;
+  gameState.pendingDraw = null;
   gameState.turnState.order = [];
   gameState.results = [...gameState.players]
     .sort((a, b) => a.position - b.position)

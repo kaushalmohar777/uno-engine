@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>UNO Engine — 4 seat Socket.IO tester</title>
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+  <style>
+    :root { font-family: Segoe UI, system-ui, sans-serif; color: #111; }
+    body { margin: 16px; background: #f4f5f7; }
+    h1 { font-size: 18px; margin: 0 0 12px; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; align-items: end; }
+    label { display: flex; flex-direction: column; font-size: 12px; gap: 4px; }
+    input, select, button, textarea { font: inherit; }
+    input, select { padding: 6px 8px; min-width: 220px; }
+    button { padding: 6px 10px; cursor: pointer; }
+    .seats { display: grid; grid-template-columns: repeat(4, minmax(240px, 1fr)); gap: 10px; }
+    .seat { background: #fff; border: 1px solid #ddd; border-radius: 8px; padding: 10px; display: flex; flex-direction: column; gap: 8px; min-height: 520px; }
+    .seat h2 { font-size: 14px; margin: 0; }
+    .status { font-size: 12px; }
+    .status.on { color: #0a7; }
+    .status.off { color: #a40; }
+    .hand { display: flex; flex-wrap: wrap; gap: 4px; min-height: 48px; }
+    .card { border: 1px solid #999; border-radius: 4px; padding: 4px 6px; font-size: 11px; cursor: pointer; background: #fafafa; }
+    .card.sel { outline: 2px solid #2563eb; }
+    .log { flex: 1; font-size: 11px; background: #111; color: #d6ffd6; padding: 8px; overflow: auto; height: 180px; white-space: pre-wrap; }
+    .actions { display: flex; flex-wrap: wrap; gap: 4px; }
+    .meta { font-size: 11px; color: #444; }
+  </style>
+</head>
+<body>
+  <h1>UNO Engine — 4 seat Socket.IO tester</h1>
+  <p class="meta">Postman collection JSON cannot create Socket.IO tabs. Use this page after <code>POST /sessions</code>.</p>
+  <div class="row">
+    <label>Engine URL <input id="engineUrl" value="http://localhost:4200" /></label>
+    <label>sessionId <input id="sessionId" placeholder="uno_..." /></label>
+    <label>matchId <input id="matchId" value="6ab10f8390d6fbe07eb1485d" /></label>
+    <button type="button" id="connectAll">Connect all</button>
+    <button type="button" id="disconnectAll">Disconnect all</button>
+  </div>
+  <div class="seats" id="seats"></div>
+
+  <script>
+    const LISTEN = [
+      "game:player-joined", "game:player-left", "game:started", "game:state-updated",
+      "game:turn-changed", "game:player-finished", "game:completed", "game:error", "game:quick-chat",
+    ];
+
+    const SEATS = [
+      { n: 1, name: "pankaj_Kushwah", userId: "67286eb612db69183d1456f0" },
+      { n: 2, name: "akshita", userId: "6748179ed64d689e4ef197b3" },
+      { n: 3, name: "testone", userId: "67273a3312db69183d144616" },
+      { n: 4, name: "KAUSHAL167", userId: "6725f74012db69183d143524" },
+    ];
+
+    const state = SEATS.map(() => ({ socket: null, hand: [], selected: null }));
+
+    function envelope(type, userId, data, kind) {
+      const msg = {
+        gameType: "uno",
+        type,
+        sessionId: document.getElementById("sessionId").value.trim(),
+        matchId: document.getElementById("matchId").value.trim(),
+        userId,
+        data: data || {},
+      };
+      if (kind) msg.kind = kind;
+      return msg;
+    }
+
+    function log(i, line) {
+      const el = document.getElementById("log-" + i);
+      el.textContent += line + "\n";
+      el.scrollTop = el.scrollHeight;
+    }
+
+    function renderHand(i) {
+      const box = document.getElementById("hand-" + i);
+      box.innerHTML = "";
+      for (const card of state[i].hand) {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.className = "card" + (state[i].selected === card.id ? " sel" : "");
+        b.textContent = [card.color, card.type, card.value].filter((v) => v !== null && v !== undefined).join(" ");
+        b.title = card.id;
+        b.onclick = () => { state[i].selected = card.id; renderHand(i); };
+        box.appendChild(b);
+      }
+    }
+
+    function connectSeat(i) {
+      const seat = SEATS[i];
+      const token = document.getElementById("token-" + i).value.trim();
+      if (!token) { log(i, "missing token"); return; }
+      disconnectSeat(i);
+      const url = document.getElementById("engineUrl").value.trim();
+      const socket = io(url, {
+        auth: { token },
+        query: { token },
+        transports: ["websocket"],
+      });
+      state[i].socket = socket;
+      socket.on("connect", () => {
+        document.getElementById("status-" + i).textContent = "connected " + socket.id;
+        document.getElementById("status-" + i).className = "status on";
+        log(i, "connected");
+      });
+      socket.on("connect_error", (err) => {
+        document.getElementById("status-" + i).textContent = "error: " + err.message;
+        document.getElementById("status-" + i).className = "status off";
+        log(i, "connect_error " + err.message);
+      });
+      socket.on("disconnect", (reason) => {
+        document.getElementById("status-" + i).textContent = "disconnected (" + reason + ")";
+        document.getElementById("status-" + i).className = "status off";
+        log(i, "disconnect " + reason);
+      });
+      for (const ev of LISTEN) {
+        socket.on(ev, (payload) => {
+          log(i, ev + " " + JSON.stringify(payload, null, 0));
+          if (ev === "game:state-updated" && payload && payload.data && Array.isArray(payload.data.yourHand)) {
+            state[i].hand = payload.data.yourHand;
+            if (!state[i].hand.some((c) => c.id === state[i].selected)) state[i].selected = null;
+            renderHand(i);
+            const meta = document.getElementById("meta-" + i);
+            meta.textContent = "color=" + payload.data.activeColor + " top=" + (payload.data.topCard && payload.data.topCard.id) + " turn=" + payload.data.currentActorId;
+          }
+        });
+      }
+    }
+
+    function disconnectSeat(i) {
+      if (state[i].socket) {
+        state[i].socket.removeAllListeners();
+        state[i].socket.disconnect();
+        state[i].socket = null;
+      }
+    }
+
+    function emitAction(i, type, data, eventName, kind) {
+      const socket = state[i].socket;
+      if (!socket || !socket.connected) { log(i, "not connected"); return; }
+      const userId = SEATS[i].userId;
+      const msg = envelope(type, userId, data, kind);
+      socket.emit(eventName || "game:action", msg);
+      log(i, "EMIT " + (eventName || "game:action") + " " + JSON.stringify(msg));
+    }
+
+    const root = document.getElementById("seats");
+    SEATS.forEach((seat, i) => {
+      const el = document.createElement("section");
+      el.className = "seat";
+      el.innerHTML = `
+        <h2>Seat ${seat.n} — ${seat.name}</h2>
+        <div class="status off" id="status-${i}">disconnected</div>
+        <label>token <input id="token-${i}" placeholder="JWT from POST /sessions" /></label>
+        <div class="actions">
+          <button type="button" data-act="connect">Connect</button>
+          <button type="button" data-act="disconnect">Disconnect</button>
+        </div>
+        <div class="meta" id="meta-${i}"></div>
+        <div class="hand" id="hand-${i}"></div>
+        <div class="actions">
+          <button type="button" data-act="play">play_card</button>
+          <button type="button" data-act="play-wild">play wild+color</button>
+          <button type="button" data-act="draw">draw_card</button>
+          <button type="button" data-act="uno">call_uno</button>
+          <button type="button" data-act="color">choose_color</button>
+          <button type="button" data-act="chat">quick-chat</button>
+        </div>
+        <label>chosenColor
+          <select id="color-${i}">
+            <option>red</option><option>yellow</option><option>green</option><option>blue</option>
+          </select>
+        </label>
+        <div class="log" id="log-${i}"></div>
+      `;
+      el.addEventListener("click", (e) => {
+        const act = e.target.getAttribute("data-act");
+        if (!act) return;
+        const color = document.getElementById("color-" + i).value;
+        if (act === "connect") connectSeat(i);
+        if (act === "disconnect") disconnectSeat(i);
+        if (act === "play") emitAction(i, "play_card", { cardId: state[i].selected, callUno: false });
+        if (act === "play-wild") emitAction(i, "play_card", { cardId: state[i].selected, chosenColor: color, callUno: false }, "game:action", "wild");
+        if (act === "draw") emitAction(i, "draw_card", {});
+        if (act === "uno") emitAction(i, "call_uno", {});
+        if (act === "color") emitAction(i, "choose_color", { chosenColor: color });
+        if (act === "chat") emitAction(i, "quick_chat", {}, "game:quick-chat", "good_luck");
+      });
+      root.appendChild(el);
+    });
+
+    document.getElementById("connectAll").onclick = () => SEATS.forEach((_, i) => connectSeat(i));
+    document.getElementById("disconnectAll").onclick = () => SEATS.forEach((_, i) => disconnectSeat(i));
+  </script>
+</body>
+</html>

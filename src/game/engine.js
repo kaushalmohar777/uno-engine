@@ -45,6 +45,15 @@ function autoPickColor(gameState) {
   return PLAYABLE_COLORS.reduce((best, c) => (counts[c] > counts[best] ? c : best), PLAYABLE_COLORS[0]);
 }
 
+/** Starts or extends the stackable +2 obligation (§3.1 — Wild Draw Four never stacks). */
+function addToDrawStack(gameState, amount) {
+  if (gameState.pendingDraw) {
+    gameState.pendingDraw.count += amount;
+  } else {
+    gameState.pendingDraw = { count: amount };
+  }
+}
+
 function drawInitialDiscard(piles) {
   // House rule: a Wild Draw Four can never be the starting discard — reshuffle
   // it back in and try again.
@@ -116,6 +125,7 @@ export function startGame(session, variant = defaultVariant) {
     activeColor: null,
     turnState: turnManager.createTurnState(players.map((p) => p.id)),
     pendingAction: null,
+    pendingDraw: null, // { count } — an unresolved, stackable +2 obligation (§3.1)
     status: 'active',
     nextPosition: 1,
     results: null,
@@ -140,19 +150,31 @@ export function getPlayerByActorId(gameState, actorId) {
 
 export function applyPlayCard(gameState, { actorId, cardId, chosenColor, callUno }) {
   if (gameState.status !== 'active') return error('Game is not active');
-  if (gameState.pendingAction) return error('A color choice is pending — play choose_color first');
 
   const player = getPlayer(gameState, actorId);
   if (!player || player.finished) return error('Player is not part of the active game');
   if (turnManager.currentPlayerId(gameState.turnState) !== player.id) return error("It is not this player's turn");
 
+  // Ownership is checked first so an off-turn player always gets "not your
+  // turn" rather than a pending-choice message that's only meaningful for
+  // whoever is actually up.
+  if (gameState.pendingAction) return error('A color choice is pending — play choose_color first');
+
   const cardIndex = player.hand.findIndex((c) => c.id === cardId);
   if (cardIndex === -1) return error('Card is not in hand');
   const card = player.hand[cardIndex];
 
-  const topCard = topOfDiscard(gameState.piles);
-  if (!cardMatches(card, { topCard, activeColor: gameState.activeColor })) {
-    return error('Card does not match the current color/card');
+  if (gameState.pendingDraw) {
+    // A +2 is owed: the only legal response is to stack another +2 (any
+    // color — §3.1) or draw_card. Wild Draw Four never stacks onto it.
+    if (card.type !== TYPES.DRAW_TWO) {
+      return error('A +2 is pending — stack another +2 or draw_card to clear it');
+    }
+  } else {
+    const topCard = topOfDiscard(gameState.piles);
+    if (!cardMatches(card, { topCard, activeColor: gameState.activeColor })) {
+      return error('Card does not match the current color/card');
+    }
   }
 
   if (isWildType(card.type) && chosenColor !== undefined && !PLAYABLE_COLORS.includes(chosenColor)) {
@@ -226,7 +248,18 @@ function applyTurnAdvanceEffects(gameState, card, finishedNow) {
       }
       break;
     case TYPES.DRAW_TWO:
-      drawCount = 2;
+      if (finishedNow) {
+        // The round ends immediately either way, so there's no next player
+        // left to hand a stackable obligation to — apply the full owed
+        // amount (any prior stack plus this card) right now, as before.
+        drawCount = (gameState.pendingDraw ? gameState.pendingDraw.count : 0) + 2;
+        gameState.pendingDraw = null;
+      } else {
+        // Stackable (§3.1): hand the (possibly extended) obligation to the
+        // next player instead of resolving it immediately. Wild Draw Four
+        // is deliberately excluded — it always resolves immediately below.
+        addToDrawStack(gameState, 2);
+      }
       break;
     case TYPES.WILD_DRAW_FOUR:
       drawCount = 4;
@@ -280,14 +313,17 @@ export function applyChooseColor(gameState, { actorId, chosenColor }) {
 
 export function applyDrawCard(gameState, { actorId }) {
   if (gameState.status !== 'active') return error('Game is not active');
-  if (gameState.pendingAction) return error('A color choice is pending — play choose_color first');
 
   const player = getPlayer(gameState, actorId);
   if (!player || player.finished) return error('Player is not part of the active game');
   if (turnManager.currentPlayerId(gameState.turnState) !== player.id) return error("It is not this player's turn");
 
-  player.hand.push(...drawFromPile(gameState.piles, 1));
+  if (gameState.pendingAction) return error('A color choice is pending — play choose_color first');
+
+  const drawCount = gameState.pendingDraw ? gameState.pendingDraw.count : 1;
+  player.hand.push(...drawFromPile(gameState.piles, drawCount));
   unoCallRules.resetCallIfHandSizeChanged(player);
+  gameState.pendingDraw = null;
   turnManager.stepIndex(gameState.turnState, 1);
 
   return ok();
@@ -330,6 +366,7 @@ export function buildPublicView(gameState) {
     direction: gameState.turnState.direction,
     currentActorId: currentActorId(gameState),
     pendingColorChoice: gameState.pendingAction ? { userId: gameState.pendingAction.userId } : null,
+    pendingDraw: gameState.pendingDraw ? { count: gameState.pendingDraw.count } : null,
     players: gameState.players.map((p) => ({
       userId: p.userId,
       seatNumber: p.seatNumber,

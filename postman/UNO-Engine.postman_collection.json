@@ -1,0 +1,98 @@
+{
+  "info": {
+    "_postman_id": "c0ffee00-uno0-4eng-1ne0-000000000001",
+    "name": "UNO Engine — REST",
+    "description": "Only HTTP belongs in a Postman Collection JSON file. Socket.IO cannot be imported as Socket.IO tabs — Postman always creates HTTP GET/POST.\n\nUse this collection for:\n- GET /health\n- POST /sessions (saves sessionId + 4 tokens into collection variables)\n\nThen open postman/uno-socket-tester.html in a browser, paste the 4 tokens, and connect all seats. That page is a real Socket.IO client.\n\nTo use Postman Socket.IO instead: New (Ctrl+N) → Socket.IO (not this collection). URL: ws://localhost:4200?token=<seatN_token>",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "GET Health",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{baseUrl}}/health",
+          "host": ["{{baseUrl}}"],
+          "path": ["health"]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test(\"status ok\", () => {",
+              "  pm.response.to.have.status(200);",
+              "  pm.expect(pm.response.json().status).to.eql(\"ok\");",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "POST Create Session",
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" },
+          { "key": "X-API-Key", "value": "{{apiKey}}" }
+        ],
+        "url": {
+          "raw": "{{baseUrl}}/sessions",
+          "host": ["{{baseUrl}}"],
+          "path": ["sessions"]
+        },
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"source\": \"duel\",\n  \"contextId\": \"{{contextId}}\",\n  \"matchId\": \"{{matchId}}\",\n  \"gameTypeSlug\": \"uno\",\n  \"players\": [\n    { \"userId\": \"{{seat1_userId}}\", \"seatNumber\": 1, \"isBot\": false },\n    { \"userId\": \"{{seat2_userId}}\", \"seatNumber\": 2, \"isBot\": false },\n    { \"userId\": \"{{seat3_userId}}\", \"seatNumber\": 3, \"isBot\": false },\n    { \"userId\": \"{{seat4_userId}}\", \"seatNumber\": 4, \"isBot\": false }\n  ]\n}",
+          "options": { "raw": { "language": "json" } }
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const json = pm.response.json();",
+              "if (pm.response.code === 200 || pm.response.code === 201) {",
+              "  if (json.gameEngineSessionId) pm.collectionVariables.set(\"sessionId\", json.gameEngineSessionId);",
+              "  const tokens = json.playerTokens || {};",
+              "  [",
+              "    [\"seat1_userId\", \"seat1_token\"],",
+              "    [\"seat2_userId\", \"seat2_token\"],",
+              "    [\"seat3_userId\", \"seat3_token\"],",
+              "    [\"seat4_userId\", \"seat4_token\"],",
+              "  ].forEach(([userVar, tokenVar]) => {",
+              "    const userId = pm.collectionVariables.get(userVar);",
+              "    if (userId && tokens[userId]) pm.collectionVariables.set(tokenVar, tokens[userId]);",
+              "  });",
+              "}",
+              "pm.test(\"status is 200 or 201\", () => {",
+              "  pm.expect([200, 201]).to.include(pm.response.code);",
+              "});"
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:4200" },
+    { "key": "apiKey", "value": "portal-key" },
+    { "key": "contextId", "value": "6aabc83303ddfbc39c7de50d" },
+    { "key": "matchId", "value": "6ab10f8390d6fbe07eb1485d" },
+    { "key": "sessionId", "value": "" },
+    { "key": "seat1_userId", "value": "67286eb612db69183d1456f0" },
+    { "key": "seat1_token", "value": "" },
+    { "key": "seat2_userId", "value": "6748179ed64d689e4ef197b3" },
+    { "key": "seat2_token", "value": "" },
+    { "key": "seat3_userId", "value": "67273a3312db69183d144616" },
+    { "key": "seat3_token", "value": "" },
+    { "key": "seat4_userId", "value": "6725f74012db69183d143524" },
+    { "key": "seat4_token", "value": "" }
+  ]
+}
